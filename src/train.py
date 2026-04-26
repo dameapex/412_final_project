@@ -8,7 +8,7 @@ import yaml
 from torch import nn
 from torch.utils.data import DataLoader
 
-from src.data.dataset import SampleBatch, SyntheticLoadDataset
+from src.data.dataset import ProcessedLoadDataset, SampleBatch, SyntheticLoadDataset
 from src.models.unet_lstm import UNetLSTMForecaster
 from src.utils.metrics import mae, mape, rmse
 from src.utils.seed import set_seed
@@ -28,10 +28,11 @@ def load_config(config_path: str | Path) -> dict:
 
 
 def build_model(config: dict) -> nn.Module:
+    input_channels = config.get("input_channels", config["num_features"])
     model_name = config.get("model_name", "unet_lstm")
     if model_name == "unet_lstm":
         return UNetLSTMForecaster(
-            input_channels=config["num_features"],
+            input_channels=input_channels,
             output_steps=config["output_steps"],
             channels=config["unet_channels"],
             lstm_hidden_size=config["lstm_hidden_size"],
@@ -42,19 +43,32 @@ def build_model(config: dict) -> nn.Module:
     raise ValueError(f"Unsupported model_name: {model_name}")
 
 
-def run_demo_training(config_path: str | Path = "configs/common.yaml") -> dict[str, float]:
-    """Run a tiny synthetic training job to verify the full pipeline."""
+def build_training_dataset(config: dict) -> Dataset:
+    processed_path = Path("data/processed/train_daily_standardized.csv")
+    if processed_path.exists():
+        return ProcessedLoadDataset(
+            split="train",
+            processed_dir=processed_path.parent,
+            use_standardized=True,
+        )
 
-    config = load_config(config_path)
-    set_seed(config["seed"])
-
-    dataset = SyntheticLoadDataset(
+    return SyntheticLoadDataset(
         num_samples=256,
         input_steps=config["input_steps"],
         output_steps=config["output_steps"],
         num_features=config["num_features"],
         seed=config["seed"],
     )
+
+
+def run_demo_training(config_path: str | Path = "configs/common.yaml") -> dict[str, float]:
+    """Run a tiny synthetic training job to verify the full pipeline."""
+
+    config = load_config(config_path)
+    set_seed(config["seed"])
+
+    dataset = build_training_dataset(config)
+    config["input_channels"] = dataset[0].inputs.shape[0]
     dataloader = DataLoader(
         dataset,
         batch_size=config["batch_size"],

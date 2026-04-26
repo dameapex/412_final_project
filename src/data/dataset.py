@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
+
+from src.data.preprocess import DATE_COLUMN, LOAD_COLUMNS
 
 
 @dataclass
@@ -13,6 +17,63 @@ class SampleBatch:
     # One multi-channel input tensor per sample: (features, time).
     inputs: torch.Tensor
     target: torch.Tensor
+
+
+class ProcessedLoadDataset(Dataset):
+    """Dataset backed by the exported processed daily csv files.
+
+    Input channels follow the current model assumption:
+    - channel 0: previous day's load profile
+    - channels 1-4: target day's calendar features broadcast across the day
+    - channels 5-7: previous day's summary statistics broadcast across the day
+    """
+
+    target_calendar_columns = ["day_of_week", "is_weekend", "month", "day_of_year"]
+    previous_summary_columns = ["daily_mean", "daily_std", "daily_range"]
+
+    def __init__(
+        self,
+        split: str,
+        processed_dir: str | Path = "data/processed",
+        use_standardized: bool = True,
+    ) -> None:
+        super().__init__()
+        processed_dir = Path(processed_dir)
+        suffix = "standardized" if use_standardized else "cleaned"
+        file_path = processed_dir / f"{split}_daily_{suffix}.csv"
+        if not file_path.exists():
+            raise FileNotFoundError(f"Processed dataset file not found: {file_path}")
+
+        frame = pd.read_csv(file_path)
+        frame[DATE_COLUMN] = pd.to_datetime(frame[DATE_COLUMN])
+        self.frame = frame.sort_values(DATE_COLUMN).reset_index(drop=True)
+        self.sample_indices = list(range(len(self.frame) - 1))
+        if not self.sample_indices:
+            raise ValueError(f"Split {split} does not contain enough rows to build next-day samples")
+
+    def __len__(self) -> int:
+        return len(self.sample_indices)
+
+    def __getitem__(self, index: int) -> SampleBatch:
+        current_index = self.sample_indices[index]
+        current_row = self.frame.iloc[current_index]
+        target_row = self.frame.iloc[current_index + 1]
+
+        previous_day_load = torch.tensor(current_row[LOAD_COLUMNS].to_numpy(dtype=float), dtype=torch.float32)
+        repeated_target_calendar = [
+            torch.full_like(previous_day_load, float(target_row[column]))
+            for column in self.target_calendar_columns
+        ]
+        repeated_previous_summary = [
+            torch.full_like(previous_day_load, float(current_row[column]))
+            for column in self.previous_summary_columns
+        ]
+        inputs = torch.stack(
+            [previous_day_load, *repeated_target_calendar, *repeated_previous_summary],
+            dim=0,
+        )
+        target = torch.tensor(target_row[LOAD_COLUMNS].to_numpy(dtype=float), dtype=torch.float32)
+        return SampleBatch(inputs=inputs, target=target)
 
 
 class SyntheticLoadDataset(Dataset):
