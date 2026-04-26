@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local outputs and generated artifacts
+outputs/
+data/raw/
+data/processed/
+
+# Local documents not required for core architecture
+Description_2026.pdf
+
+# Toolchain and environment validation
+tests/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/

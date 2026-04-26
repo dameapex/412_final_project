@@ -1,0 +1,12 @@
+seed: 42
+batch_size: 32
+epochs: 3
+learning_rate: 0.001
+input_steps: 96
+output_steps: 96
+num_features: 8
+tcn_channels:
+  - 32
+  - 64
+  - 64
+dropout: 0.1
