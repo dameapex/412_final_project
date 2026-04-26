@@ -53,10 +53,10 @@ class DecoderStage(nn.Module):
         return self.fuse(merged)
 
 
-class ScaleRecurrentHead(nn.Module):
-    """Run recurrent modeling on one temporal scale and emit a full-resolution forecast."""
+class SkipTemporalBlock(nn.Module):
+    """Enhance skip features with an LSTM before decoder fusion."""
 
-    def __init__(self, channels: int, hidden_size: int, output_steps: int, dropout: float, lstm_layers: int) -> None:
+    def __init__(self, channels: int, hidden_size: int, dropout: float, lstm_layers: int) -> None:
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=channels,
@@ -65,37 +65,31 @@ class ScaleRecurrentHead(nn.Module):
             batch_first=True,
             dropout=dropout if lstm_layers > 1 else 0.0,
         )
-        self.projection = nn.Linear(hidden_size, 1)
-        self.output_steps = output_steps
+        self.projection = nn.Linear(hidden_size, channels)
 
-    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        sequence_first = features.transpose(1, 2)
+    def forward(self, skip: torch.Tensor) -> torch.Tensor:
+        sequence_first = skip.transpose(1, 2)
         recurrent_outputs, _ = self.lstm(sequence_first)
-        scale_signal = self.projection(recurrent_outputs).transpose(1, 2)
-        pooled_descriptor = recurrent_outputs.mean(dim=1)
-        upsampled_signal = nn.functional.interpolate(
-            scale_signal,
-            size=self.output_steps,
-            mode="linear",
-            align_corners=False,
-        )
-        return upsampled_signal.squeeze(1), pooled_descriptor
+        projected = self.projection(recurrent_outputs).transpose(1, 2)
+        return projected + skip
 
 
 class UNetLSTMForecaster(nn.Module):
-    """U-shaped 1D forecaster with multi-scale recurrent prediction heads.
+    """U-shaped 1D forecaster with LSTM-enhanced skip connections.
 
-    Each downsampled temporal scale is sent through its own LSTM head so the
-    model can make scale-specific forecasts instead of relying only on the
-    coarsest bottleneck representation. A learned fusion module then combines the
-    scale forecasts with the decoder forecast. The final output is produced as a
-    residual correction on top of the previous day's load curve.
+    The model consumes one multi-channel input tensor (for example: previous
+    day's load, weather, and calendar features) and predicts a single target
+    load sequence.
+
+    Encoder skip features are first passed through per-scale LSTM blocks and the
+    temporally enhanced skips are then fused by matching decoder stages. The
+    final output is produced as a residual correction on top of the previous
+    day's load curve (channel 0 of the input).
     """
 
     def __init__(
         self,
         input_channels: int = 1,
-        context_dim: int = 8,
         output_steps: int = 96,
         channels: list[int] | None = None,
         lstm_hidden_size: int = 64,
@@ -114,18 +108,13 @@ class UNetLSTMForecaster(nn.Module):
             current_channels = next_channels
         self.encoder_stages = nn.ModuleList(encoder_stages)
 
-        self.context_projection = nn.Sequential(
-            nn.Linear(context_dim, channels[-1]),
-            nn.ReLU(),
-        )
         self.bottleneck_conv = ConvBlock(channels[-1], channels[-1], dropout)
 
-        self.scale_heads = nn.ModuleList(
+        self.skip_temporal_blocks = nn.ModuleList(
             [
-                ScaleRecurrentHead(
+                SkipTemporalBlock(
                     channels=stage_channels,
                     hidden_size=lstm_hidden_size,
-                    output_steps=output_steps,
                     dropout=dropout,
                     lstm_layers=lstm_layers,
                 )
@@ -134,43 +123,42 @@ class UNetLSTMForecaster(nn.Module):
         )
 
         decoder_stages = []
-        decoder_specs = [
-            (channels[-1], channels[-1], channels[-1]),
-            (channels[-1], channels[-2], channels[-2]),
-            (channels[-2], channels[-3], channels[-3]),
-        ]
-        for in_channels, skip_channels, out_channels in decoder_specs:
-            decoder_stages.append(DecoderStage(in_channels, skip_channels, out_channels, dropout))
+        decoder_input_channels = channels[-1]
+        for skip_channels in reversed(channels):
+            decoder_stages.append(DecoderStage(decoder_input_channels, skip_channels, skip_channels, dropout))
+            decoder_input_channels = skip_channels
         self.decoder_stages = nn.ModuleList(decoder_stages)
         self.output_head = nn.Conv1d(channels[0], 1, kernel_size=1)
-        fusion_input_dim = (len(channels) * lstm_hidden_size) + context_dim
-        self.scale_weight_mlp = nn.Sequential(
-            nn.Linear(fusion_input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, len(channels) + 1),
-        )
         self.residual_refine = nn.Sequential(
-            nn.Linear(output_steps + context_dim, 128),
+            nn.Linear(output_steps, 128),
             nn.ReLU(),
             nn.Linear(128, output_steps),
         )
         self.output_steps = output_steps
 
-    def forward(self, history: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        squeeze_batch = False
+        if inputs.dim() == 2:
+            inputs = inputs.unsqueeze(0)
+            squeeze_batch = True
+        elif inputs.dim() != 3:
+            raise ValueError("inputs must have shape (features, time) or (batch, features, time)")
+
         skips: list[torch.Tensor] = []
-        scale_features: list[torch.Tensor] = []
-        encoded = history
+        encoded = inputs
         for stage in self.encoder_stages:
             skip, encoded = stage(encoded)
             skips.append(skip)
-            scale_features.append(encoded)
 
         bottleneck = self.bottleneck_conv(encoded)
-        context_bias = self.context_projection(context).unsqueeze(-1)
-        bottleneck = bottleneck + context_bias
+
+        temporal_skips = [
+            block(skip)
+            for block, skip in zip(self.skip_temporal_blocks, skips)
+        ]
 
         decoded = bottleneck
-        for stage, skip in zip(self.decoder_stages, reversed(skips)):
+        for stage, skip in zip(self.decoder_stages, reversed(temporal_skips)):
             decoded = stage(decoded, skip)
 
         decoder_forecast = self.output_head(decoded).squeeze(1)
@@ -182,22 +170,18 @@ class UNetLSTMForecaster(nn.Module):
                 align_corners=False,
             ).squeeze(1)
 
-        scale_forecasts = []
-        scale_descriptors = []
-        for head, features in zip(self.scale_heads, scale_features):
-            forecast, descriptor = head(features)
-            scale_forecasts.append(forecast)
-            scale_descriptors.append(descriptor)
+        baseline = inputs[:, 0, :]
+        if baseline.size(-1) != self.output_steps:
+            baseline = nn.functional.interpolate(
+                baseline.unsqueeze(1),
+                size=self.output_steps,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(1)
 
-        fusion_features = torch.cat(scale_descriptors + [context], dim=1)
-        fusion_weights = torch.softmax(self.scale_weight_mlp(fusion_features), dim=1)
-
-        combined_forecasts = scale_forecasts + [decoder_forecast]
-        fused = sum(
-            fusion_weights[:, index].unsqueeze(1) * forecast
-            for index, forecast in enumerate(combined_forecasts)
-        )
-        baseline = history[:, 0, : self.output_steps]
-        residual_input = torch.cat([fused, context], dim=1)
+        residual_input = decoder_forecast
         residual_delta = self.residual_refine(residual_input)
-        return baseline + residual_delta
+        outputs = baseline + residual_delta
+        if squeeze_batch:
+            return outputs.squeeze(0)
+        return outputs

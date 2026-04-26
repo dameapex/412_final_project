@@ -17,10 +17,9 @@ from src.utils.seed import set_seed
 def _collate_fn(batch: list[SampleBatch]) -> SampleBatch:
     """Keep the training loop explicit instead of unpacking raw tuples everywhere."""
 
-    history = torch.stack([item.history for item in batch])
-    context = torch.stack([item.context for item in batch])
+    inputs = torch.stack([item.inputs for item in batch])
     target = torch.stack([item.target for item in batch])
-    return SampleBatch(history=history, context=context, target=target)
+    return SampleBatch(inputs=inputs, target=target)
 
 
 def load_config(config_path: str | Path) -> dict:
@@ -32,8 +31,7 @@ def build_model(config: dict) -> nn.Module:
     model_name = config.get("model_name", "unet_lstm")
     if model_name == "unet_lstm":
         return UNetLSTMForecaster(
-            input_channels=1,
-            context_dim=config["num_features"],
+            input_channels=config["num_features"],
             output_steps=config["output_steps"],
             channels=config["unet_channels"],
             lstm_hidden_size=config["lstm_hidden_size"],
@@ -75,12 +73,11 @@ def run_demo_training(config_path: str | Path = "configs/common.yaml") -> dict[s
     for epoch in range(config["epochs"]):
         epoch_loss = 0.0
         for batch in dataloader:
-            history = batch.history.to(device)
-            context = batch.context.to(device)
+            inputs = batch.inputs.to(device)
             target = batch.target.to(device)
 
             optimizer.zero_grad()
-            predictions = model(history, context)
+            predictions = model(inputs)
             loss = loss_fn(predictions, target)
             loss.backward()
             optimizer.step()

@@ -10,16 +10,16 @@ from torch.utils.data import Dataset
 class SampleBatch:
     """Container used by the training loop for readability."""
 
-    history: torch.Tensor
-    context: torch.Tensor
+    # One multi-channel input tensor per sample: (features, time).
+    inputs: torch.Tensor
     target: torch.Tensor
 
 
 class SyntheticLoadDataset(Dataset):
     """Small synthetic dataset for smoke tests and pipeline validation.
 
-    Each sample uses one day's 96-point load curve plus a small context vector
-    to predict the next day's 96-point curve.
+    Each sample uses one day's multi-feature 96-point sequence to predict the
+    next day's 96-point target load curve.
     """
 
     def __init__(
@@ -36,8 +36,7 @@ class SyntheticLoadDataset(Dataset):
         time_axis = torch.linspace(0, 2 * torch.pi, input_steps)
         base_curve = 0.6 * torch.sin(time_axis) + 0.3 * torch.cos(2 * time_axis)
 
-        history = []
-        context = []
+        inputs = []
         target = []
         for index in range(num_samples):
             phase = index / 14.0
@@ -46,20 +45,29 @@ class SyntheticLoadDataset(Dataset):
             curve = base_curve + daily_shift + 0.2 * torch.sin(time_axis + phase) + noise
             next_curve = curve.roll(-4) + 0.03 * torch.randn(output_steps, generator=generator)
 
-            history.append(curve.unsqueeze(0))
-            context.append(torch.rand(num_features, generator=generator))
+            # Channel 0 is the target load history baseline used by the model residual output.
+            feature_channels = [curve]
+            # Additional channels emulate exogenous features (weather/calendar-like signals).
+            for feature_index in range(max(0, num_features - 1)):
+                freq = 1.0 + (feature_index % 3)
+                phase_shift = 0.15 * feature_index + phase
+                seasonal = torch.sin(freq * time_axis + phase_shift)
+                trend = (feature_index + 1) * 0.02 * torch.linspace(0, 1, input_steps)
+                feature_noise = 0.02 * torch.randn(input_steps, generator=generator)
+                feature_channels.append(seasonal + trend + feature_noise)
+
+            # Final input shape per sample: (num_features, input_steps).
+            inputs.append(torch.stack(feature_channels[:num_features], dim=0))
             target.append(next_curve)
 
-        self.history = torch.stack(history).float()
-        self.context = torch.stack(context).float()
+        self.inputs = torch.stack(inputs).float()
         self.target = torch.stack(target).float()
 
     def __len__(self) -> int:
-        return self.history.size(0)
+        return self.inputs.size(0)
 
     def __getitem__(self, index: int) -> SampleBatch:
         return SampleBatch(
-            history=self.history[index],
-            context=self.context[index],
+            inputs=self.inputs[index],
             target=self.target[index],
         )
