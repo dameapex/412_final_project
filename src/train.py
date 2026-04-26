@@ -9,7 +9,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from src.data.dataset import SampleBatch, SyntheticLoadDataset
-from src.models.tcn import TCNForecaster
+from src.models.unet_lstm import UNetLSTMForecaster
 from src.utils.metrics import mae, mape, rmse
 from src.utils.seed import set_seed
 
@@ -26,6 +26,22 @@ def _collate_fn(batch: list[SampleBatch]) -> SampleBatch:
 def load_config(config_path: str | Path) -> dict:
     with Path(config_path).open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def build_model(config: dict) -> nn.Module:
+    model_name = config.get("model_name", "unet_lstm")
+    if model_name == "unet_lstm":
+        return UNetLSTMForecaster(
+            input_channels=1,
+            context_dim=config["num_features"],
+            output_steps=config["output_steps"],
+            channels=config["unet_channels"],
+            lstm_hidden_size=config["lstm_hidden_size"],
+            lstm_layers=config["lstm_layers"],
+            dropout=config["dropout"],
+        )
+
+    raise ValueError(f"Unsupported model_name: {model_name}")
 
 
 def run_demo_training(config_path: str | Path = "configs/common.yaml") -> dict[str, float]:
@@ -49,13 +65,7 @@ def run_demo_training(config_path: str | Path = "configs/common.yaml") -> dict[s
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TCNForecaster(
-        input_channels=1,
-        context_dim=config["num_features"],
-        output_steps=config["output_steps"],
-        channels=config["tcn_channels"],
-        dropout=config["dropout"],
-    ).to(device)
+    model = build_model(config).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
     loss_fn = nn.MSELoss()

@@ -2,6 +2,17 @@
 
 This repository provides a minimal PyTorch scaffold for short-term load forecasting.
 
+## Current midterm direction
+
+The current primary model is a 1D U-Net with an LSTM bottleneck.
+
+- Encoder: repeated convolution blocks + max-pooling for multi-scale temporal feature extraction.
+- Bottleneck: LSTM over the compressed sequence to model longer-range dependency.
+- Decoder: transposed convolution upsampling with skip connections from the encoder.
+- Context fusion: calendar or weather features can be projected into the bottleneck.
+
+This keeps the architecture aligned with the project goal: learn short-term local load patterns with convolutions, then refine global temporal dependency with recurrent modeling.
+
 ## Project layout
 
 - `configs/`: model and training configuration.
@@ -20,3 +31,5 @@ This repository provides a minimal PyTorch scaffold for short-term load forecast
 ```
 
 The demo train command uses synthetic data so you can verify the training loop before wiring in the real dataset.
+
+For raw-data integration, start from `src/data/preprocess.py`. It provides a first-pass pipeline for loading csv/xlsx files, checking the 96-point daily layout, adding simple calendar features, and splitting the dataset according to the course schedule.
