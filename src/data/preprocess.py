@@ -29,6 +29,7 @@ VALIDATION_FILE = "validation_data.xlsx"
 TEST_FILE = "test_data_to_students.xlsx"
 DEFAULT_TIME_INTERVAL_MINUTES = 15
 MAX_NEGATIVE_POINTS_PER_DAY = 8         # Allow some negative points to be repaired, but if a day is mostly negative then it's probably too noisy to learn from.
+MIN_STANDARDIZER_STD = 0.05
 
 
 def _build_load_columns() -> list[str]:
@@ -199,7 +200,11 @@ def _hour_to_day_part(hour: int) -> str:
     return "night"
 
 
-def fit_standardizer(frame: pd.DataFrame, columns: list[str]) -> dict[str, dict[str, float]]:
+def fit_standardizer(
+    frame: pd.DataFrame,
+    columns: list[str],
+    min_std: float = MIN_STANDARDIZER_STD,
+) -> dict[str, dict[str, float]]:
     # Fit z-score parameters on the training split only.
 
     stats: dict[str, dict[str, float]] = {}
@@ -207,7 +212,8 @@ def fit_standardizer(frame: pd.DataFrame, columns: list[str]) -> dict[str, dict[
         mean = float(frame[column].mean())
         std = float(frame[column].std())
         if std == 0 or np.isnan(std):
-            std = 1.0
+            std = min_std
+        std = max(std, min_std)
         stats[column] = {"mean": mean, "std": std}
     return stats
 

@@ -19,13 +19,21 @@ def _build_demo_features(num_features: int, input_steps: int) -> torch.Tensor:
 
     time_axis = torch.linspace(0, 2 * torch.pi, input_steps)
     load_curve = 0.9 + 0.25 * torch.sin(time_axis) + 0.1 * torch.cos(2 * time_axis)
-    channels = [load_curve]
-    for feature_index in range(max(0, num_features - 1)):
+
+    # Keep demo inputs aligned with training schema: load + calendar + summary features.
+    latest_curve = load_curve
+    day_of_week = torch.full_like(latest_curve, 2.0 / 6.0)
+    is_weekend = torch.full_like(latest_curve, 0.0)
+    month = torch.full_like(latest_curve, 6.0 / 12.0)
+    day_of_year = torch.full_like(latest_curve, 0.5)
+    daily_mean = torch.full_like(latest_curve, float(latest_curve.mean()))
+    daily_std = torch.full_like(latest_curve, float(latest_curve.std(unbiased=False)))
+    daily_range = torch.full_like(latest_curve, float(latest_curve.max() - latest_curve.min()))
+    channels = [load_curve, day_of_week, is_weekend, month, day_of_year, daily_mean, daily_std, daily_range]
+    for feature_index in range(max(0, num_features - len(channels))):
         freq = 1.0 + (feature_index % 3)
         phase = 0.2 * feature_index
-        seasonal = torch.sin(freq * time_axis + phase)
-        trend = (feature_index + 1) * 0.03 * torch.linspace(0, 1, input_steps)
-        channels.append(seasonal + trend)
+        channels.append(torch.sin(freq * time_axis + phase))
     return torch.stack(channels[:num_features], dim=0).unsqueeze(0)
 
 

@@ -54,7 +54,7 @@ class DecoderStage(nn.Module):
 
 
 class SkipTemporalBlock(nn.Module):
-    """Enhance skip features with an LSTM before decoder fusion."""
+    """Enhance skip features with a BiLSTM before decoder fusion."""
 
     def __init__(self, channels: int, hidden_size: int, dropout: float, lstm_layers: int) -> None:
         super().__init__()
@@ -63,9 +63,10 @@ class SkipTemporalBlock(nn.Module):
             hidden_size=hidden_size,
             num_layers=lstm_layers,
             batch_first=True,
+            bidirectional=True,
             dropout=dropout if lstm_layers > 1 else 0.0,
         )
-        self.projection = nn.Linear(hidden_size, channels)
+        self.projection = nn.Linear(hidden_size * 2, channels)
 
     def forward(self, skip: torch.Tensor) -> torch.Tensor:
         sequence_first = skip.transpose(1, 2)
@@ -98,8 +99,8 @@ class UNetLSTMForecaster(nn.Module):
     ) -> None:
         super().__init__()
         channels = channels or [16, 32, 64]
-        if len(channels) < 2:
-            raise ValueError("UNetLSTMForecaster requires at least two channel stages")
+        if len(channels) < 1:
+            raise ValueError("UNetLSTMForecaster requires at least one channel stage")
 
         encoder_stages = []
         current_channels = input_channels
