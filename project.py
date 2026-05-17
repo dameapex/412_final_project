@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.train_baseline_lstm import run_lstm_baseline_training
+from src.train_baseline_lstm import run_baseline_training
 from src.train import run_demo_training, run_training_with_split_metrics
 
 
@@ -27,9 +27,19 @@ def build_parser() -> argparse.ArgumentParser:
 	plot_parser.add_argument("--output-prefix", default=None)
 	plot_parser.set_defaults(command="plot-preprocess")
 
-	lstm_baseline_parser = subparsers.add_parser("lstm-baseline", help="Train and evaluate LSTM baseline")
+	baseline_parser = subparsers.add_parser("baseline", help="Train and evaluate baseline model (LSTM/TCN)")
+	baseline_parser.add_argument("--config", default="configs/common.yaml")
+	baseline_parser.add_argument("--baseline-type", choices=["lstm", "tcn"], default=None)
+	baseline_parser.set_defaults(command="baseline")
+
+	lstm_baseline_parser = subparsers.add_parser("lstm-baseline", help="Backward-compatible alias of baseline")
 	lstm_baseline_parser.add_argument("--config", default="configs/common.yaml")
+	lstm_baseline_parser.add_argument("--baseline-type", choices=["lstm", "tcn"], default=None)
 	lstm_baseline_parser.set_defaults(command="lstm-baseline")
+
+	tcn_baseline_parser = subparsers.add_parser("tcn-baseline", help="Train and evaluate TCN baseline")
+	tcn_baseline_parser.add_argument("--config", default="configs/common.yaml")
+	tcn_baseline_parser.set_defaults(command="tcn-baseline")
 	return parser
 
 
@@ -55,8 +65,24 @@ def main() -> None:
 		print(processed_output_path)
 		return
 
+	if args.command == "baseline":
+		split_metrics = run_baseline_training(
+			config_path=args.config,
+			baseline_model_type=args.baseline_type,
+		)
+		print(split_metrics)
+		return
+
 	if args.command == "lstm-baseline":
-		split_metrics = run_lstm_baseline_training(config_path=args.config)
+		split_metrics = run_baseline_training(
+			config_path=args.config,
+			baseline_model_type=args.baseline_type,
+		)
+		print(split_metrics)
+		return
+
+	if args.command == "tcn-baseline":
+		split_metrics = run_baseline_training(config_path=args.config, baseline_model_type="tcn")
 		print(split_metrics)
 		return
 

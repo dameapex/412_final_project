@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.data.dataset import ProcessedLoadDataset, SampleBatch, SyntheticLoadDataset
 from src.data.preprocess import LOAD_COLUMNS, save_processed_outputs
-from src.models.baseline import LSTMBaselineForecaster
+from src.models.baseline import LSTMBaselineForecaster, TCNBaselineForecaster
 from src.utils.seed import set_seed
 
 
@@ -21,9 +21,51 @@ def _collate_fn(batch: list[SampleBatch]) -> SampleBatch:
     return SampleBatch(inputs=inputs, target=target)
 
 
+def _apply_mixup(inputs: torch.Tensor, target: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
+    if inputs.size(0) < 2 or alpha <= 0:
+        return inputs, target
+    lam = float(torch.distributions.Beta(alpha, alpha).sample().item())
+    permutation = torch.randperm(inputs.size(0), device=inputs.device)
+    mixed_inputs = lam * inputs + (1.0 - lam) * inputs[permutation]
+    mixed_target = lam * target + (1.0 - lam) * target[permutation]
+    return mixed_inputs, mixed_target
+
+
 def load_config(config_path: str | Path) -> dict:
     with Path(config_path).open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def _build_baseline_model(config: dict, input_channels: int) -> tuple[str, nn.Module]:
+    baseline_model_type = str(config.get("baseline_model_type", "lstm")).strip().lower()
+    if baseline_model_type == "lstm":
+        baseline_hidden_size = int(config.get("baseline_lstm_hidden_size", config["lstm_hidden_size"]))
+        model = LSTMBaselineForecaster(
+            input_channels=input_channels,
+            input_steps=config["input_steps"],
+            output_steps=config["output_steps"],
+            hidden_size=baseline_hidden_size,
+            num_layers=1,
+            dropout=config["dropout"],
+        )
+        return baseline_model_type, model
+
+    if baseline_model_type == "tcn":
+        tcn_channels = config.get("baseline_tcn_channels", [32, 32, 32])
+        model = TCNBaselineForecaster(
+            input_channels=input_channels,
+            input_steps=config["input_steps"],
+            output_steps=config["output_steps"],
+            channels=[int(channel) for channel in tcn_channels],
+            kernel_size=int(config.get("baseline_tcn_kernel_size", 3)),
+            dropout=float(config.get("baseline_tcn_dropout", config["dropout"])),
+        )
+        return baseline_model_type, model
+
+    raise ValueError(
+        "Unsupported baseline_model_type. Use 'lstm' or 'tcn'. "
+        f"Got: {baseline_model_type}"
+    )
 
 
 def _ensure_processed_data() -> None:
@@ -67,6 +109,9 @@ def _build_split_datasets(config: dict) -> dict[str, Dataset]:
     amplitude_jitter_min = config.get("amplitude_jitter_min", 1.0)
     amplitude_jitter_max = config.get("amplitude_jitter_max", 1.0)
     input_noise_std = config.get("input_noise_std", 0.0)
+    time_mask_prob = config.get("time_mask_prob", 0.0)
+    time_mask_min_width = int(config.get("time_mask_min_width", 0))
+    time_mask_max_width = int(config.get("time_mask_max_width", 0))
     suffix = "standardized" if use_standardized_data else "cleaned"
     split_datasets: dict[str, Dataset] = {}
     for split_name in ["train", "validation", "test"]:
@@ -83,6 +128,9 @@ def _build_split_datasets(config: dict) -> dict[str, Dataset]:
                 amplitude_jitter_min=amplitude_jitter_min,
                 amplitude_jitter_max=amplitude_jitter_max,
                 input_noise_std=input_noise_std,
+                time_mask_prob=time_mask_prob,
+                time_mask_min_width=time_mask_min_width,
+                time_mask_max_width=time_mask_max_width,
             )
 
     if split_datasets:
@@ -100,6 +148,9 @@ def _build_split_datasets(config: dict) -> dict[str, Dataset]:
         amplitude_jitter_min=amplitude_jitter_min,
         amplitude_jitter_max=amplitude_jitter_max,
         input_noise_std=input_noise_std,
+        time_mask_prob=time_mask_prob,
+        time_mask_min_width=time_mask_min_width,
+        time_mask_max_width=time_mask_max_width,
     )
     return split_datasets
 
@@ -153,13 +204,20 @@ def _evaluate_dataset(
     }
 
 
-def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") -> dict[str, float]:
-    """Train and evaluate LSTM baseline, reporting final RMSE by split."""
+def run_lstm_baseline_training(
+    config_path: str | Path = "configs/common.yaml",
+    baseline_model_type: str | None = None,
+) -> dict[str, float]:
+    """Train and evaluate baseline model (LSTM/TCN), reporting final RMSE by split."""
 
     _ensure_processed_data()
     config = load_config(config_path)
+    if baseline_model_type is not None:
+        config["baseline_model_type"] = baseline_model_type
     set_seed(config["seed"])
     use_standardized_data = config.get("use_standardized_data", True)
+    mixup_prob = float(config.get("mixup_prob", 0.0))
+    mixup_alpha = float(config.get("mixup_alpha", 0.2))
 
     split_datasets = _build_split_datasets(config)
     train_dataset = split_datasets["train"]
@@ -171,32 +229,42 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
         collate_fn=_collate_fn,
     )
 
-    input_channels = train_dataset[0].inputs.shape[0]
-    baseline_hidden_size = config.get("baseline_lstm_hidden_size", config["lstm_hidden_size"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = LSTMBaselineForecaster(
-        input_channels=input_channels,
-        input_steps=config["input_steps"],
-        output_steps=config["output_steps"],
-        hidden_size=baseline_hidden_size,
-        num_layers=1,
-        dropout=config["dropout"],
-    ).to(device)
+    input_channels = train_dataset[0].inputs.shape[0]
+    selected_model_type, model = _build_baseline_model(config, input_channels)
+    model = model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+    use_cosine_annealing = config.get("use_cosine_annealing", True)
+    cosine_t_max = max(1, int(config.get("cosine_t_max", 10)))
+    cosine_eta_min = float(config.get("cosine_eta_min", 1e-6))
+    scheduler = None
+    if use_cosine_annealing:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_t_max,
+            eta_min=cosine_eta_min,
+        )
     loss_fn = nn.MSELoss()
     denorm_std = _load_denormalization_std(Path("data/processed")) if use_standardized_data else None
     denorm_std_on_device = denorm_std.to(device) if denorm_std is not None else None
     validation_dataset = split_datasets.get("validation")
+    test_dataset = split_datasets.get("test")
+    print(f"baseline_model_type={selected_model_type}")
 
     for epoch in range(config["epochs"]):
         model.train()
         sum_squared_error = 0.0
         sum_squared_error_real = 0.0
+        sum_absolute_percentage_error = 0.0
         total_elements = 0
+        epsilon = 1e-6
         for batch in train_loader:
             inputs = batch.inputs.to(device)
             target = batch.target.to(device)
+
+            if mixup_prob > 0 and torch.rand(1).item() < mixup_prob:
+                inputs, target = _apply_mixup(inputs, target, mixup_alpha)
 
             optimizer.zero_grad()
             predictions = model(inputs)
@@ -210,6 +278,7 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
                 if denorm_std_on_device is not None:
                     error_real = error * denorm_std_on_device.view(1, -1)
                     sum_squared_error_real += (error_real ** 2).sum().item()
+                sum_absolute_percentage_error += (error.abs() / target.abs().clamp(min=epsilon)).sum().item()
                 total_elements += error.numel()
 
         epoch_rmse = sqrt(sum_squared_error / total_elements)
@@ -218,6 +287,12 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
             if denorm_std_on_device is not None
             else epoch_rmse
         )
+        epoch_mape = (sum_absolute_percentage_error / total_elements) * 100.0
+        epoch_report = [
+            f"epoch={epoch + 1}",
+            f"train_rmse={epoch_rmse_real:.4f}",
+            f"train_mape={epoch_mape:.2f}",
+        ]
         if validation_dataset is not None:
             validation_metrics = _evaluate_dataset(
                 model=model,
@@ -226,19 +301,24 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
                 device=device,
                 denorm_std=denorm_std,
             )
-            print(
-                f"epoch={epoch + 1} "
-                f"train_rmse_z={epoch_rmse:.4f} "
-                f"train_rmse_real={epoch_rmse_real:.4f} "
-                f"validation_rmse_z={validation_metrics['rmse']:.4f} "
-                f"validation_rmse_real={validation_metrics['rmse_real']:.4f}"
+            epoch_report.append(f"validation_rmse={validation_metrics['rmse_real']:.4f}")
+            epoch_report.append(f"validation_mape={validation_metrics['mape']:.2f}")
+        if test_dataset is not None:
+            test_metrics = _evaluate_dataset(
+                model=model,
+                dataset=test_dataset,
+                batch_size=config["batch_size"],
+                device=device,
+                denorm_std=denorm_std,
             )
-        else:
-            print(
-                f"epoch={epoch + 1} "
-                f"train_rmse_z={epoch_rmse:.4f} "
-                f"train_rmse_real={epoch_rmse_real:.4f}"
-            )
+            epoch_report.append(f"test_rmse={test_metrics['rmse_real']:.4f}")
+            epoch_report.append(f"test_mape={test_metrics['mape']:.2f}")
+        epoch_report.append(f"lr={optimizer.param_groups[0]['lr']:.8f}")
+        print(" ".join(epoch_report))
+
+        # Converges around epoch 10 in current setting; decay to eta_min then keep it stable.
+        if scheduler is not None and epoch < cosine_t_max:
+            scheduler.step()
 
     split_rmse: dict[str, float] = {}
     print("Final RMSE by split:")
@@ -253,10 +333,22 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
             device=device,
             denorm_std=denorm_std,
         )
-        split_rmse[split_name] = metrics["rmse"]
-        print(f"{split_name}_rmse_z={metrics['rmse']:.4f} {split_name}_rmse_real={metrics['rmse_real']:.4f}")
+        split_rmse[split_name] = metrics["rmse_real"]
+        print(f"{split_name}_rmse={metrics['rmse_real']:.4f} {split_name}_mape={metrics['mape']:.2f}")
 
     return split_rmse
+
+
+def run_baseline_training(
+    config_path: str | Path = "configs/common.yaml",
+    baseline_model_type: str | None = None,
+) -> dict[str, float]:
+    """Public unified baseline training entrypoint."""
+
+    return run_lstm_baseline_training(
+        config_path=config_path,
+        baseline_model_type=baseline_model_type,
+    )
 
 
 if __name__ == "__main__":

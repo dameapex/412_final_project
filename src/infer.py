@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 import yaml
 
+from src.models.stacked_lstm import StackedLSTMForecaster
 from src.models.unet_lstm import UNetLSTMForecaster
 
 
@@ -50,14 +51,31 @@ def export_demo_submission(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model = UNetLSTMForecaster(
-        input_channels=config["num_features"],
-        output_steps=config["output_steps"],
-        channels=config["unet_channels"],
-        lstm_hidden_size=config["lstm_hidden_size"],
-        lstm_layers=config["lstm_layers"],
-        dropout=config["dropout"],
-    )
+    use_multiscale_u = config.get("use_multiscale_u", True)
+    if use_multiscale_u:
+        model = UNetLSTMForecaster(
+            input_channels=config["num_features"],
+            output_steps=config["output_steps"],
+            channels=config["unet_channels"],
+            lstm_hidden_size=config["lstm_hidden_size"],
+            lstm_layers=config["lstm_layers"],
+            dropout=config["dropout"],
+            use_residual_output=config.get("use_residual_output", True),
+            use_bidirectional_skip_lstm=config.get("use_bidirectional_skip_lstm", False),
+            skip_temporal_mode=str(config.get("skip_temporal_mode", "lstm")),
+            skip_tcn_layers=int(config.get("skip_tcn_layers", 2)),
+            skip_tcn_kernel_size=int(config.get("skip_tcn_kernel_size", 3)),
+            skip_tcn_dropout=config.get("skip_tcn_dropout", None),
+        )
+    else:
+        model = StackedLSTMForecaster(
+            input_channels=config["num_features"],
+            output_steps=config["output_steps"],
+            channels=config["unet_channels"],
+            lstm_layers=config["lstm_layers"],
+            dropout=config["dropout"],
+            use_residual_output=config.get("use_residual_output", True),
+        )
     model.eval()
 
     demo_inputs = _build_demo_features(config["num_features"], config["input_steps"])

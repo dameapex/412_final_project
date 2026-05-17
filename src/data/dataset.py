@@ -49,6 +49,9 @@ class ProcessedLoadDataset(Dataset):
         amplitude_jitter_min: float = 1.0,
         amplitude_jitter_max: float = 1.0,
         input_noise_std: float = 0.0,
+        time_mask_prob: float = 0.0,
+        time_mask_min_width: int = 0,
+        time_mask_max_width: int = 0,
     ) -> None:
         super().__init__()
         if time_slice_stride < 1:
@@ -77,6 +80,31 @@ class ProcessedLoadDataset(Dataset):
         self.amplitude_jitter_min = amplitude_jitter_min
         self.amplitude_jitter_max = amplitude_jitter_max
         self.input_noise_std = input_noise_std
+        self.time_mask_prob = time_mask_prob
+        self.time_mask_min_width = time_mask_min_width
+        self.time_mask_max_width = time_mask_max_width
+
+    def _apply_time_mask(self, sequence: torch.Tensor) -> torch.Tensor:
+        if self.time_mask_prob <= 0 or self.time_mask_max_width <= 0:
+            return sequence
+        if torch.rand(1).item() >= self.time_mask_prob:
+            return sequence
+
+        length = sequence.numel()
+        min_width = max(1, min(self.time_mask_min_width, length))
+        max_width = max(min_width, min(self.time_mask_max_width, length))
+        if max_width <= 0:
+            return sequence
+
+        width = int(torch.randint(min_width, max_width + 1, (1,)).item())
+        start = int(torch.randint(0, max(1, length - width + 1), (1,)).item())
+        end = start + width
+
+        masked = sequence.clone()
+        left_value = masked[start - 1] if start > 0 else masked[end] if end < length else masked.mean()
+        right_value = masked[end] if end < length else left_value
+        masked[start:end] = torch.linspace(left_value, right_value, width, device=sequence.device, dtype=sequence.dtype)
+        return masked
 
     def _augment_sample(self, inputs: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         augmented_inputs = inputs.clone()
@@ -90,6 +118,8 @@ class ProcessedLoadDataset(Dataset):
 
         if self.input_noise_std > 0:
             augmented_load = augmented_load + torch.randn_like(augmented_load) * self.input_noise_std
+
+        augmented_load = self._apply_time_mask(augmented_load)
 
         augmented_inputs[0] = augmented_load
 
@@ -165,6 +195,9 @@ class SyntheticLoadDataset(Dataset):
         amplitude_jitter_min: float = 1.0,
         amplitude_jitter_max: float = 1.0,
         input_noise_std: float = 0.0,
+        time_mask_prob: float = 0.0,
+        time_mask_min_width: int = 0,
+        time_mask_max_width: int = 0,
     ) -> None:
         super().__init__()
         if time_slice_stride < 1:
@@ -224,6 +257,9 @@ class SyntheticLoadDataset(Dataset):
         self.amplitude_jitter_min = amplitude_jitter_min
         self.amplitude_jitter_max = amplitude_jitter_max
         self.input_noise_std = input_noise_std
+        self.time_mask_prob = time_mask_prob
+        self.time_mask_min_width = time_mask_min_width
+        self.time_mask_max_width = time_mask_max_width
         self.summary_channel_start = 1 + len(ProcessedLoadDataset.target_calendar_columns)
         self.sample_specs = [
             _SampleSpec(sample_index=sample_index, slice_offset=offset)
@@ -243,6 +279,22 @@ class SyntheticLoadDataset(Dataset):
 
         if self.input_noise_std > 0:
             augmented_load = augmented_load + torch.randn_like(augmented_load) * self.input_noise_std
+        if self.time_mask_prob > 0 and self.time_mask_max_width > 0 and torch.rand(1).item() < self.time_mask_prob:
+            length = augmented_load.numel()
+            min_width = max(1, min(self.time_mask_min_width, length))
+            max_width = max(min_width, min(self.time_mask_max_width, length))
+            width = int(torch.randint(min_width, max_width + 1, (1,)).item())
+            start = int(torch.randint(0, max(1, length - width + 1), (1,)).item())
+            end = start + width
+            left_value = augmented_load[start - 1] if start > 0 else augmented_load[end] if end < length else augmented_load.mean()
+            right_value = augmented_load[end] if end < length else left_value
+            augmented_load[start:end] = torch.linspace(
+                left_value,
+                right_value,
+                width,
+                device=augmented_load.device,
+                dtype=augmented_load.dtype,
+            )
         augmented_inputs[0] = augmented_load
         summary_values = [
             float(augmented_load.mean()),
