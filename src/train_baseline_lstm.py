@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from math import sqrt
 from pathlib import Path
@@ -11,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.data.dataset import ProcessedLoadDataset, SampleBatch, SyntheticLoadDataset
 from src.data.preprocess import LOAD_COLUMNS, save_processed_outputs
-from src.models.baseline import LSTMBaselineForecaster
+from src.models.baseline import LSTMBaselineForecaster, TCNBaselineForecaster
 from src.utils.seed import set_seed
 
 
@@ -153,11 +154,46 @@ def _evaluate_dataset(
     }
 
 
-def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") -> dict[str, float]:
-    """Train and evaluate LSTM baseline, reporting final RMSE by split."""
+def _build_baseline_model(
+    baseline_name: str,
+    config: dict,
+    input_channels: int,
+) -> nn.Module:
+    hidden_size = config.get("baseline_lstm_hidden_size", config["lstm_hidden_size"])
+    common_kwargs = {
+        "input_channels": input_channels,
+        "input_steps": config["input_steps"],
+        "output_steps": config["output_steps"],
+        "hidden_size": hidden_size,
+        "num_layers": 1,
+        "dropout": config["dropout"],
+    }
+
+    if baseline_name == "lstm":
+        return LSTMBaselineForecaster(**common_kwargs)
+    if baseline_name == "tcn":
+        return TCNBaselineForecaster(
+            input_channels=input_channels,
+            input_steps=config["input_steps"],
+            output_steps=config["output_steps"],
+            channels=config.get("baseline_tcn_channels", [16, 32, 32]),
+            kernel_size=config.get("baseline_tcn_kernel_size", 3),
+            dropout=config["dropout"],
+        )
+    raise ValueError(f"Unsupported baseline_name: {baseline_name}")
+
+
+def run_baseline_training(
+    config_path: str | Path = "configs/common.yaml",
+    baseline_name: str = "lstm",
+    epochs_override: int | None = None,
+) -> dict[str, float]:
+    """Train and evaluate one baseline, reporting final RMSE by split."""
 
     _ensure_processed_data()
     config = load_config(config_path)
+    if epochs_override is not None:
+        config["epochs"] = epochs_override
     set_seed(config["seed"])
     use_standardized_data = config.get("use_standardized_data", True)
 
@@ -171,16 +207,12 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
         collate_fn=_collate_fn,
     )
 
-    input_channels = train_dataset[0].inputs.shape[0]
-    baseline_hidden_size = config.get("baseline_lstm_hidden_size", config["lstm_hidden_size"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = LSTMBaselineForecaster(
+    input_channels = train_dataset[0].inputs.shape[0]
+    model = _build_baseline_model(
+        baseline_name=baseline_name,
+        config=config,
         input_channels=input_channels,
-        input_steps=config["input_steps"],
-        output_steps=config["output_steps"],
-        hidden_size=baseline_hidden_size,
-        num_layers=1,
-        dropout=config["dropout"],
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
@@ -227,7 +259,7 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
                 denorm_std=denorm_std,
             )
             print(
-                f"epoch={epoch + 1} "
+                f"baseline={baseline_name} epoch={epoch + 1} "
                 f"train_rmse_z={epoch_rmse:.4f} "
                 f"train_rmse_real={epoch_rmse_real:.4f} "
                 f"validation_rmse_z={validation_metrics['rmse']:.4f} "
@@ -235,13 +267,13 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
             )
         else:
             print(
-                f"epoch={epoch + 1} "
+                f"baseline={baseline_name} epoch={epoch + 1} "
                 f"train_rmse_z={epoch_rmse:.4f} "
                 f"train_rmse_real={epoch_rmse_real:.4f}"
             )
 
     split_rmse: dict[str, float] = {}
-    print("Final RMSE by split:")
+    print(f"Final RMSE by split for baseline={baseline_name}:")
     for split_name in ["train", "validation", "test"]:
         dataset = split_datasets.get(split_name)
         if dataset is None:
@@ -257,6 +289,46 @@ def run_lstm_baseline_training(config_path: str | Path = "configs/common.yaml") 
         print(f"{split_name}_rmse_z={metrics['rmse']:.4f} {split_name}_rmse_real={metrics['rmse_real']:.4f}")
 
     return split_rmse
+
+
+def run_lstm_baseline_training(
+    config_path: str | Path = "configs/common.yaml",
+    epochs_override: int | None = None,
+) -> dict[str, float]:
+    return run_baseline_training(
+        config_path=config_path,
+        baseline_name="lstm",
+        epochs_override=epochs_override,
+    )
+
+
+def run_tcn_baseline_training(
+    config_path: str | Path = "configs/common.yaml",
+    epochs_override: int | None = None,
+) -> dict[str, float]:
+    return run_baseline_training(
+        config_path=config_path,
+        baseline_name="tcn",
+        epochs_override=epochs_override,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train baseline forecasters")
+    parser.add_argument("--config", default="configs/common.yaml")
+    parser.add_argument("--model", choices=["lstm", "tcn"], default="lstm")
+    parser.add_argument("--epochs", type=int, default=None)
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    result = run_baseline_training(
+        config_path=args.config,
+        baseline_name=args.model,
+        epochs_override=args.epochs,
+    )
+    print(result)
 
 
 if __name__ == "__main__":

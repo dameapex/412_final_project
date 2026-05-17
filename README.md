@@ -26,8 +26,9 @@ This keeps the architecture aligned with the project goal: learn short-term loca
 
 ```powershell
 .venv/Scripts/python.exe project.py smoke-test
-.venv/Scripts/python.exe project.py demo-train
-.venv/Scripts/python.exe project.py lstm-baseline
+.venv/Scripts/python.exe project.py demo-train --config configs/common.yaml
+.venv/Scripts/python.exe project.py baseline-train --model lstm --epochs 1
+.venv/Scripts/python.exe project.py baseline-train --model tcn --epochs 1
 .venv/Scripts/python.exe -m src.infer
 ```
 
