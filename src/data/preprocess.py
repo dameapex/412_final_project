@@ -27,6 +27,7 @@ DAYPART_COLUMN = "day_part"
 TRAIN_FILE = "train_data.xlsx"
 VALIDATION_FILE = "validation_data.xlsx"
 TEST_FILE = "test_data_to_students.xlsx"
+WEATHER_DAILY_FILE = "data/weather/haining_weather_2022_2024_daily.csv"
 DEFAULT_TIME_INTERVAL_MINUTES = 15
 MAX_NEGATIVE_POINTS_PER_DAY = 8         # Allow some negative points to be repaired, but if a day is mostly negative then it's probably too noisy to learn from.
 MIN_STANDARDIZER_STD = 0.05
@@ -37,6 +38,21 @@ def _build_load_columns() -> list[str]:
     return [f"load_{index:02d}" for index in range(1, 97)]
 
 LOAD_COLUMNS = _build_load_columns()
+WEATHER_COLUMNS = [
+    "temperature_2m_max",
+    "temperature_2m_min",
+    "temperature_2m_mean",
+    "apparent_temperature_max",
+    "apparent_temperature_min",
+    "precipitation_sum",
+    "rain_sum",
+    "snowfall_sum",
+    "precipitation_hours",
+    "relative_humidity_2m_mean",
+    "wind_speed_10m_max",
+    "wind_gusts_10m_max",
+    "shortwave_radiation_sum",
+]
 
 def _convert_excel_date(value: object) -> pd.Timestamp:
     # Training/validation dates are Excel serial numbers; test dates are already real datetimes.
@@ -170,6 +186,37 @@ def add_daily_features(frame: pd.DataFrame) -> pd.DataFrame:
     return enriched
 
 
+def load_weather_daily(base_dir: str | Path) -> pd.DataFrame:
+    weather_path = Path(base_dir) / WEATHER_DAILY_FILE
+    if not weather_path.exists():
+        raise FileNotFoundError(
+            f"Weather table not found: {weather_path}. "
+            "Please fetch weather data first."
+        )
+
+    weather = pd.read_csv(weather_path)
+    required_columns = [DATE_COLUMN, *WEATHER_COLUMNS]
+    missing = [column for column in required_columns if column not in weather.columns]
+    if missing:
+        raise ValueError(f"Weather table missing columns: {missing}")
+
+    weather = weather[required_columns].copy()
+    weather[DATE_COLUMN] = pd.to_datetime(weather[DATE_COLUMN]).dt.normalize()
+    weather = weather.sort_values(DATE_COLUMN).drop_duplicates(subset=[DATE_COLUMN], keep="last").reset_index(drop=True)
+    weather[WEATHER_COLUMNS] = weather[WEATHER_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    weather[WEATHER_COLUMNS] = weather[WEATHER_COLUMNS].ffill().bfill()
+    return weather
+
+
+def add_weather_features(frame: pd.DataFrame, weather_daily: pd.DataFrame) -> pd.DataFrame:
+    enriched = frame.copy()
+    enriched[DATE_COLUMN] = pd.to_datetime(enriched[DATE_COLUMN]).dt.normalize()
+    merged = enriched.merge(weather_daily, on=DATE_COLUMN, how="left")
+    merged[WEATHER_COLUMNS] = merged[WEATHER_COLUMNS].ffill().bfill()
+    merged[WEATHER_COLUMNS] = merged[WEATHER_COLUMNS].fillna(0.0)
+    return merged
+
+
 def daily_to_long(frame: pd.DataFrame) -> pd.DataFrame:
     # Explode the daily 96-point table into a long table with explicit time tags.
 
@@ -227,7 +274,11 @@ def apply_standardizer(frame: pd.DataFrame, stats: dict[str, dict[str, float]]) 
     return standardized
 
 
-def build_split_stages(file_path: str | Path, split_name: str) -> dict[str, pd.DataFrame]:
+def build_split_stages(
+    file_path: str | Path,
+    split_name: str,
+    weather_daily: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
     # Return intermediate preprocessing stages for one split.
 
     # This is useful for diagnostics and plotting so we can compare the raw daily
@@ -239,6 +290,7 @@ def build_split_stages(file_path: str | Path, split_name: str) -> dict[str, pd.D
     negative_repaired, noise_report = repair_negative_values(missing_repaired, split_name=split_name)
     outlier_repaired = repair_outliers(negative_repaired)
     featured = add_daily_features(outlier_repaired)
+    featured = add_weather_features(featured, weather_daily)
     return {
         "raw": standardized_schema,
         "missing_repaired": missing_repaired,
@@ -249,7 +301,7 @@ def build_split_stages(file_path: str | Path, split_name: str) -> dict[str, pd.D
     }
 
 
-def build_all_split_stages(base_dir: str | Path) -> dict[str, dict[str, pd.DataFrame]]:
+def build_all_split_stages(base_dir: str | Path, weather_daily: pd.DataFrame) -> dict[str, dict[str, pd.DataFrame]]:
     # Build intermediate preprocessing stages for train/validation/test splits.
 
     base_dir = Path(base_dir)
@@ -258,7 +310,10 @@ def build_all_split_stages(base_dir: str | Path) -> dict[str, dict[str, pd.DataF
         "validation": base_dir / VALIDATION_FILE,
         "test": base_dir / TEST_FILE,
     }
-    return {split_name: build_split_stages(file_path, split_name=split_name) for split_name, file_path in file_map.items()}
+    return {
+        split_name: build_split_stages(file_path, split_name=split_name, weather_daily=weather_daily)
+        for split_name, file_path in file_map.items()
+    }
 
 
 def save_processed_outputs(base_dir: str | Path, output_dir: str | Path | None = None) -> dict[str, Path]:
@@ -268,7 +323,8 @@ def save_processed_outputs(base_dir: str | Path, output_dir: str | Path | None =
     output_dir = Path(output_dir) if output_dir else base_dir / "data" / "processed"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_stages = build_all_split_stages(base_dir)
+    weather_daily = load_weather_daily(base_dir)
+    all_stages = build_all_split_stages(base_dir, weather_daily=weather_daily)
     processed = {split_name: stages["featured"] for split_name, stages in all_stages.items()}
     feature_columns = [
         *LOAD_COLUMNS,
@@ -276,6 +332,7 @@ def save_processed_outputs(base_dir: str | Path, output_dir: str | Path | None =
         "month",
         "day_of_year",
         "week_of_year",
+        *WEATHER_COLUMNS,
         "daily_mean",
         "daily_std",
         "daily_max",

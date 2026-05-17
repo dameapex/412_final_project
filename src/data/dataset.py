@@ -31,12 +31,28 @@ class ProcessedLoadDataset(Dataset):
     Input channels follow the current model assumption:
     - channel 0: previous day's load profile
     - channels 1-4: target day's calendar features broadcast across the day
-    - channels 5-7: previous day's summary statistics broadcast across the day
+    - channels 5-17: target day's weather features broadcast across the day
+    - channels 18-20: previous day's summary statistics broadcast across the day
     """
 
     target_calendar_columns = ["day_of_week", "is_weekend", "month", "day_of_year"]
+    target_weather_columns = [
+        "temperature_2m_max",
+        "temperature_2m_min",
+        "temperature_2m_mean",
+        "apparent_temperature_max",
+        "apparent_temperature_min",
+        "precipitation_sum",
+        "rain_sum",
+        "snowfall_sum",
+        "precipitation_hours",
+        "relative_humidity_2m_mean",
+        "wind_speed_10m_max",
+        "wind_gusts_10m_max",
+        "shortwave_radiation_sum",
+    ]
     previous_summary_columns = ["daily_mean", "daily_std", "daily_range"]
-    summary_channel_start = 1 + len(target_calendar_columns)
+    summary_channel_start = 1 + len(target_calendar_columns) + len(target_weather_columns)
 
     def __init__(
         self,
@@ -74,7 +90,11 @@ class ProcessedLoadDataset(Dataset):
             for sample_index in base_sample_indices
             for offset in range(0, len(LOAD_COLUMNS), time_slice_stride)
         ]
-        self.summary_channel_start = 1 + len(self.target_calendar_columns)
+        self.summary_channel_start = (
+            1
+            + len(self.target_calendar_columns)
+            + len(self.target_weather_columns)
+        )
         self.enable_augmentation = enable_augmentation
         self.amplitude_jitter_prob = amplitude_jitter_prob
         self.amplitude_jitter_min = amplitude_jitter_min
@@ -158,12 +178,21 @@ class ProcessedLoadDataset(Dataset):
             torch.full_like(previous_day_load, float(target_row[column]))
             for column in self.target_calendar_columns
         ]
+        repeated_target_weather = [
+            torch.full_like(previous_day_load, float(target_row.get(column, 0.0)))
+            for column in self.target_weather_columns
+        ]
         repeated_previous_summary = [
             torch.full_like(previous_day_load, float(current_row[column]))
             for column in self.previous_summary_columns
         ]
         inputs = torch.stack(
-            [previous_day_load, *repeated_target_calendar, *repeated_previous_summary],
+            [
+                previous_day_load,
+                *repeated_target_calendar,
+                *repeated_target_weather,
+                *repeated_previous_summary,
+            ],
             dim=0,
         )
         target = self._slice_sequence(
@@ -237,7 +266,28 @@ class SyntheticLoadDataset(Dataset):
             for value in calendar_features:
                 feature_channels.append(torch.full_like(latest_curve, value))
 
-            # Channels 5-7 are repeated summary statistics for the previous day.
+            # Channels 5-17 are repeated weather features for the target day.
+            annual_phase = 2 * torch.pi * ((index % 365) / 365.0)
+            seasonal_temp = 18.0 + 10.0 * float(torch.sin(torch.tensor(annual_phase)))
+            weather_values = [
+                seasonal_temp + 6.0,
+                seasonal_temp - 5.0,
+                seasonal_temp,
+                seasonal_temp + 4.0,
+                seasonal_temp - 6.0,
+                max(0.0, float(torch.rand(1, generator=generator).item() * 8.0 - 1.0)),
+                max(0.0, float(torch.rand(1, generator=generator).item() * 7.0 - 1.0)),
+                0.0,
+                float(torch.rand(1, generator=generator).item() * 4.0),
+                55.0 + 30.0 * float(torch.rand(1, generator=generator).item()),
+                8.0 + 10.0 * float(torch.rand(1, generator=generator).item()),
+                12.0 + 12.0 * float(torch.rand(1, generator=generator).item()),
+                8.0 + 18.0 * max(0.0, float(torch.sin(torch.tensor(annual_phase)))),
+            ]
+            for value in weather_values:
+                feature_channels.append(torch.full_like(latest_curve, float(value)))
+
+            # Channels 18-20 are repeated summary statistics for the previous day.
             daily_mean = float(latest_curve.mean())
             daily_std = float(latest_curve.std(unbiased=False))
             daily_range = float(latest_curve.max() - latest_curve.min())
@@ -260,7 +310,11 @@ class SyntheticLoadDataset(Dataset):
         self.time_mask_prob = time_mask_prob
         self.time_mask_min_width = time_mask_min_width
         self.time_mask_max_width = time_mask_max_width
-        self.summary_channel_start = 1 + len(ProcessedLoadDataset.target_calendar_columns)
+        self.summary_channel_start = (
+            1
+            + len(ProcessedLoadDataset.target_calendar_columns)
+            + len(ProcessedLoadDataset.target_weather_columns)
+        )
         self.sample_specs = [
             _SampleSpec(sample_index=sample_index, slice_offset=offset)
             for sample_index in range(self.inputs.size(0))

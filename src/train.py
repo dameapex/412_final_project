@@ -5,6 +5,7 @@ from dataclasses import asdict
 from math import sqrt
 from pathlib import Path
 
+import pandas as pd
 import torch
 import yaml
 from torch import nn
@@ -34,6 +35,20 @@ def _apply_mixup(inputs: torch.Tensor, target: torch.Tensor, alpha: float) -> tu
     mixed_inputs = lam * inputs + (1.0 - lam) * inputs[permutation]
     mixed_target = lam * target + (1.0 - lam) * target[permutation]
     return mixed_inputs, mixed_target
+
+
+def _weighted_rmse_mape_loss(
+    predictions: torch.Tensor,
+    target: torch.Tensor,
+    rmse_weight: float,
+    mape_weight: float,
+    mape_epsilon: float,
+) -> torch.Tensor:
+    error = predictions - target
+    mse_value = torch.mean(error ** 2)
+    rmse_value = torch.sqrt(mse_value + 1e-12)
+    mape_value = torch.mean(torch.abs(error) / target.abs().clamp(min=mape_epsilon))
+    return rmse_weight * rmse_value + mape_weight * mape_value
 
 
 def load_config(config_path: str | Path) -> dict:
@@ -71,7 +86,12 @@ def build_model(config: dict) -> nn.Module:
 
 
 def build_training_dataset(config: dict) -> Dataset:
-    expected_num_features = 1 + len(ProcessedLoadDataset.target_calendar_columns) + len(ProcessedLoadDataset.previous_summary_columns)
+    expected_num_features = (
+        1
+        + len(ProcessedLoadDataset.target_calendar_columns)
+        + len(ProcessedLoadDataset.target_weather_columns)
+        + len(ProcessedLoadDataset.previous_summary_columns)
+    )
     config["num_features"] = expected_num_features
     time_slice_stride = config.get("train_time_slice_stride", 96)
     use_standardized_data = config.get("use_standardized_data", True)
@@ -123,7 +143,13 @@ def build_training_dataset(config: dict) -> Dataset:
 def _ensure_processed_data() -> None:
     processed_train_path = Path("data/processed/train_daily_standardized.csv")
     if processed_train_path.exists():
-        return
+        try:
+            header_columns = set(pd.read_csv(processed_train_path, nrows=0).columns)
+            required_weather_columns = set(ProcessedLoadDataset.target_weather_columns)
+            if required_weather_columns.issubset(header_columns):
+                return
+        except Exception:
+            pass
 
     required_raw_files = [
         Path("train_data.xlsx"),
@@ -224,6 +250,9 @@ def run_training_with_split_metrics(config_path: str | Path = "configs/common.ya
     use_standardized_data = config.get("use_standardized_data", True)
     mixup_prob = float(config.get("mixup_prob", 0.0))
     mixup_alpha = float(config.get("mixup_alpha", 0.2))
+    loss_rmse_weight = float(config.get("loss_rmse_weight", 0.5))
+    loss_mape_weight = float(config.get("loss_mape_weight", 0.5))
+    loss_mape_epsilon = float(config.get("loss_mape_epsilon", 1e-3))
 
     train_dataset = build_training_dataset(config)
     config["input_channels"] = train_dataset[0].inputs.shape[0]
@@ -247,7 +276,6 @@ def run_training_with_split_metrics(config_path: str | Path = "configs/common.ya
             T_max=cosine_t_max,
             eta_min=cosine_eta_min,
         )
-    loss_fn = nn.MSELoss()
     denorm_std = _load_denormalization_std(Path("data/processed")) if use_standardized_data else None
     denorm_std_on_device = denorm_std.to(device) if denorm_std is not None else None
     split_datasets = _build_processed_split_datasets(
@@ -256,6 +284,12 @@ def run_training_with_split_metrics(config_path: str | Path = "configs/common.ya
     )
     validation_dataset = split_datasets.get("validation")
     test_dataset = split_datasets.get("test")
+    checkpoint_dir = Path(config.get("best_model_dir", "outputs/checkpoints"))
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    model_tag = "unet_lstm" if config.get("use_multiscale_u", True) else "stacked_lstm"
+    best_checkpoint_path = checkpoint_dir / f"{model_tag}_best_test_rmse.pt"
+    best_test_rmse = float("inf")
+    best_epoch_record: dict[str, float] | None = None
     for epoch in range(config["epochs"]):
         model.train()
         sum_squared_error = 0.0
@@ -272,7 +306,13 @@ def run_training_with_split_metrics(config_path: str | Path = "configs/common.ya
 
             optimizer.zero_grad()
             predictions = model(inputs)
-            loss = loss_fn(predictions, target)
+            loss = _weighted_rmse_mape_loss(
+                predictions=predictions,
+                target=target,
+                rmse_weight=loss_rmse_weight,
+                mape_weight=loss_mape_weight,
+                mape_epsilon=loss_mape_epsilon,
+            )
             loss.backward()
             optimizer.step()
 
@@ -297,6 +337,7 @@ def run_training_with_split_metrics(config_path: str | Path = "configs/common.ya
             f"train_rmse={epoch_rmse_real:.4f}",
             f"train_mape={epoch_mape:.2f}",
         ]
+        validation_metrics = None
         if validation_dataset is not None:
             validation_metrics = _evaluate_dataset(
                 model=model,
@@ -307,6 +348,7 @@ def run_training_with_split_metrics(config_path: str | Path = "configs/common.ya
             )
             epoch_report.append(f"validation_rmse={validation_metrics['rmse_real']:.4f}")
             epoch_report.append(f"validation_mape={validation_metrics['mape']:.2f}")
+        test_metrics = None
         if test_dataset is not None:
             test_metrics = _evaluate_dataset(
                 model=model,
@@ -317,6 +359,28 @@ def run_training_with_split_metrics(config_path: str | Path = "configs/common.ya
             )
             epoch_report.append(f"test_rmse={test_metrics['rmse_real']:.4f}")
             epoch_report.append(f"test_mape={test_metrics['mape']:.2f}")
+            if test_metrics["rmse_real"] < best_test_rmse:
+                best_test_rmse = test_metrics["rmse_real"]
+                best_epoch_record = {
+                    "epoch": float(epoch + 1),
+                    "train_rmse": float(epoch_rmse_real),
+                    "train_mape": float(epoch_mape),
+                    "validation_rmse": float(validation_metrics["rmse_real"]) if validation_metrics is not None else float("nan"),
+                    "validation_mape": float(validation_metrics["mape"]) if validation_metrics is not None else float("nan"),
+                    "test_rmse": float(test_metrics["rmse_real"]),
+                    "test_mape": float(test_metrics["mape"]),
+                }
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "epoch": epoch + 1,
+                        "best_test_rmse": best_test_rmse,
+                        "best_epoch_record": best_epoch_record,
+                        "config": config,
+                    },
+                    best_checkpoint_path,
+                )
+                epoch_report.append(f"best_test_rmse={best_test_rmse:.4f}")
         epoch_report.append(f"lr={optimizer.param_groups[0]['lr']:.8f}")
         print(" ".join(epoch_report))
 
@@ -327,8 +391,20 @@ def run_training_with_split_metrics(config_path: str | Path = "configs/common.ya
     if not split_datasets:
         split_datasets = {"train": train_dataset}
 
+    if best_epoch_record is not None and best_checkpoint_path.exists():
+        checkpoint = torch.load(best_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(
+            "Best epoch summary "
+            f"epoch={int(best_epoch_record['epoch'])} "
+            f"train_rmse={best_epoch_record['train_rmse']:.4f} "
+            f"validation_rmse={best_epoch_record['validation_rmse']:.4f} "
+            f"test_rmse={best_epoch_record['test_rmse']:.4f}"
+        )
+        print(f"best_checkpoint={best_checkpoint_path}")
+
     split_rmse: dict[str, float] = {}
-    print("Final RMSE by split:")
+    print("Best-epoch RMSE by split:")
     for split_name in ["train", "validation", "test"]:
         dataset = split_datasets.get(split_name)
         if dataset is None:

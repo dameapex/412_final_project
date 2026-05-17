@@ -1,0 +1,31 @@
+{
+  "source": "Open-Meteo Historical Weather API (ERA5/ECMWF reanalysis)",
+  "url": "https://archive-api.open-meteo.com/v1/archive?latitude=30.5256&longitude=120.6889&start_date=2022-01-01&end_date=2024-12-31&timezone=Asia%2FShanghai&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_max,apparent_temperature_min,precipitation_sum,rain_sum,snowfall_sum,precipitation_hours,relative_humidity_2m_mean,wind_speed_10m_max,wind_gusts_10m_max,shortwave_radiation_sum",
+  "location": {
+    "name": "Haining, Zhejiang, China",
+    "latitude": 30.5256,
+    "longitude": 120.6889
+  },
+  "period": {
+    "start": "2022-01-01",
+    "end": "2024-12-31"
+  },
+  "timezone": "Asia/Shanghai",
+  "daily_units": {
+    "time": "iso8601",
+    "temperature_2m_max": "°C",
+    "temperature_2m_min": "°C",
+    "temperature_2m_mean": "°C",
+    "apparent_temperature_max": "°C",
+    "apparent_temperature_min": "°C",
+    "precipitation_sum": "mm",
+    "rain_sum": "mm",
+    "snowfall_sum": "cm",
+    "precipitation_hours": "h",
+    "relative_humidity_2m_mean": "%",
+    "wind_speed_10m_max": "km/h",
+    "wind_gusts_10m_max": "km/h",
+    "shortwave_radiation_sum": "MJ/m²"
+  },
+  "row_count": 1096
+}

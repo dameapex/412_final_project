@@ -1,14 +1,14 @@
 seed: 3407
 model_name: unet_lstm
 batch_size: 16
-epochs: 40
+epochs: 60
 learning_rate: 0.0003
 use_cosine_annealing: true
-cosine_t_max: 30
-cosine_eta_min: 0.00001
+cosine_t_max: 10
+cosine_eta_min: 0.0001
 input_steps: 96
 output_steps: 96
-num_features: 8
+num_features: 21
 use_standardized_data: false
 use_multiscale_u: true
 unet_channels:
@@ -40,3 +40,7 @@ time_mask_min_width: 4
 time_mask_max_width: 8
 mixup_prob: 0.3
 mixup_alpha: 0.2
+loss_rmse_weight: 1
+loss_mape_weight: 0
+loss_mape_epsilon: 0.001
+best_model_dir: outputs/checkpoints
